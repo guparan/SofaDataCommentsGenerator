@@ -1,28 +1,14 @@
-#include <queue>
-#include <chrono>
-
-#include <clang/Basic/Diagnostic.h>
-#include <clang/Basic/FileManager.h>
-#include <clang/Basic/TargetInfo.h>
-#include <clang/Frontend/ASTUnit.h>
-#include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Tooling/Tooling.h>
-#include <clang/Parse/ParseAST.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/Rewrite/Core/Rewriter.h>
+#include <clang/ASTMatchers/ASTMatchers.h>
+#include <clang/ASTMatchers/ASTMatchFinder.h>
+
 #include <iostream>
-
-#include "clang/Rewrite/Core/Rewriter.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
-#include "clang/ASTMatchers/ASTMatchFinder.h"
-
-static std::map<std::string, std::chrono::steady_clock::duration> ast_time;
-static std::map<std::string, std::chrono::steady_clock::duration> visite_time;
-static unsigned int current_file = 0;
-static size_t nb_files = 0;
-
-static clang::CompilerInstance *compiler_instance;
+#include <string>
+#include <regex>
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -30,27 +16,9 @@ using namespace clang::driver;
 using namespace clang::tooling;
 
 
-void encode(std::string& data) 
-{
-    std::string buffer;
-    buffer.reserve(data.size());
-    for(size_t pos = 0; pos != data.size(); ++pos) 
-    {
-        switch(data[pos]) 
-        {
-            case '&':  buffer.append("&amp;");       break;
-            case '\"': buffer.append("&quot;");      break;
-            case '\'': buffer.append("&apos;");      break;
-            case '<':  buffer.append("&lt;");        break;
-            case '>':  buffer.append("&gt;");        break;
-            case '\n':  buffer.append("\\n");        break;
-            case '\\':  buffer.append("\\\\");        break;
-            case '|':  buffer.append("\\|");        break;
-            default:   buffer.append(&data[pos], 1); break;
-        }
-    }
-    data.swap(buffer);
-}
+static std::list<std::string> parsed_members;
+static int count = 0;
+
 
 class FindInitCallVisitor : public RecursiveASTVisitor<FindInitCallVisitor> 
 {
@@ -58,89 +26,132 @@ public:
 
     FindInitCallVisitor(Rewriter &R) : theRewriter(R) {}
 
-    bool VisitCallExpr(CallExpr *e) 
-    {
-		if (member && e->getCalleeDecl() && e->getCalleeDecl()->getAsFunction()->getNameAsString() == "initData")
-        {
-			std::cout << member->getFirstDecl()->getLocation().printToString(theRewriter.getSourceMgr()) << " : " << member->getNameAsString();
+	void printUncommentedData(CallExpr *e, std::string memberLocation)
+	{
+		SourceRange help_sr = e->getArg(e->getNumArgs() - 3)->getSourceRange();
+		std::string help_comment = theRewriter.getRewrittenText(help_sr);
+		help_comment = help_comment.substr(1, help_comment.size() - 2); // remove first and last char (dublequotes)
 
-			ASTContext &context = member->getFirstDecl()->getASTContext();
-			const RawComment* rc = context.getRawCommentForDeclNoCache(member->getFirstDecl());
-            if (rc) 
-            {
-                SourceRange range = rc->getSourceRange();
+		ASTContext &context = member->getFirstDecl()->getASTContext();
+		const RawComment* rc = context.getRawCommentForDeclNoCache(member->getFirstDecl());
 
-				PresumedLoc startPos = theRewriter.getSourceMgr().getPresumedLoc(range.getBegin());
-				PresumedLoc endPos = theRewriter.getSourceMgr().getPresumedLoc(range.getEnd());
-
-				std::string raw = rc->getRawText(theRewriter.getSourceMgr());
-                std::cout << " : ALREADY COMMENTED :  " << raw;
-            }
-            else
-            {
-				//CallExpr::arg_iterator it = e->arg_end();
-				SourceRange help_sr = e->getArg( e->getNumArgs() - 3 )->getSourceRange();
-				
-                // TODO: add comment to member here
-				//context.addComment(RawComment(sr, RawComment::RCK_BCPLSlash, true, false, false));
-
-				//PresumedLoc startPos = theRewriter.getSourceMgr().getPresumedLoc(sr.getBegin());
-
-
-				//theRewriter.overwriteChangedFiles();
-
-
-				//context.addComment(RawComment(context.getSourceManager(), member->getSourceRange(), true, false));
-				theRewriter.InsertText(member->getFirstDecl()->getLocEnd(), " ///< "+theRewriter.getRewrittenText(help_sr));
-				//theRewriter.overwriteChangedFiles();
-				std::cout << " : " << theRewriter.getRewrittenText(help_sr);
-
-				
-				/*
-				if (theRewriter.isRewritable(member->getFirstDecl()->getLocation()))
-				{
-					if (theRewriter.InsertTextAfter(member->getFirstDecl()->getLocation(), StringRef("THIS IS A TEST")))
-					{
-						std::cout << " : PROBLEM";
-					}
-					else
-					{
-						std::cout << " : OK";
-					}
-
-					std::cout << " : " << theRewriter.getRewrittenText(help_sr);
-				}
-				else
-				{
-					std::cout << " : NOT REWRITABLE";
-				}
-				
-
-				
-				std::cout << " : " << e->getNumArgs();
-				for (int i = 0; i < e->getNumArgs(); ++i)
-				{
-					std::cout << " : " << theRewriter.getRewrittenText(e->getArg(i)->getSourceRange());
-				}
-				*/
-				
+		if (!rc)
+		{
+			std::cout << "NOT COMMENTED : " << memberLocation << " : " << member->getNameAsString();
+			if (help_comment.length() == 0)
+			{
+				std::cout << " : INITDATA EMPTY";
 			}
+			std::cout << "\n";
+			count++;
+		}
+	}
 
-			//theRewriter.InsertText(member->getFirstDecl()->getLocation(), "THIS IS A TEST", true, true);
-			//theRewriter.overwriteChangedFiles();
+	void editDataComment(std::string comment)
+	{
+		ASTContext &context = member->getFirstDecl()->getASTContext();
+		const RawComment* rc = context.getRawCommentForDeclNoCache(member->getFirstDecl());
 
-            std::cout << "\n";
-        }
+		if (rc)
+		{
+			//std::cout << "ALREADY COMMENTED :  " << std::string(rc->getRawText(theRewriter.getSourceMgr()));
+			return;
+		}		
+			
+		// Old
+		//theRewriter.InsertText(member->getFirstDecl()->getLocStart(), "/// " + help_comment + "\n", false, true);
+		//theRewriter.InsertText(member->getFirstDecl()->getOuterLocStart() + member->getNameAsString().length(), " ///< " + theRewriter.getRewrittenText(help_sr), false);
+		//theRewriter.ReplaceText(member->getFirstDecl()->getSourceRange(), "COUCOU");
+		//RawComment newComment = RawComment(theRewriter.getSourceMgr(), member->getFirstDecl()->getSourceRange(), true, true);
+		//context.addComment()
 
-        return true;
-    }
+		int offset = 0;
+		std::string declString = "";
+		clang::SourceLocation begin(member->getFirstDecl()->getLocStart());
+		clang::SourceLocation _e, end;
+			
+		while (declString.find(';') == std::string::npos) // searching end of declaration
+		{
+			_e = clang::SourceLocation(member->getFirstDecl()->getSourceRange().getEnd().getLocWithOffset(offset));
+			end = clang::SourceLocation(clang::Lexer::getLocForEndOfToken(_e, 0, theRewriter.getSourceMgr(), theRewriter.getLangOpts()));
+			declString = std::string(theRewriter.getSourceMgr().getCharacterData(begin), theRewriter.getSourceMgr().getCharacterData(end) - theRewriter.getSourceMgr().getCharacterData(begin));
+			offset++;
+		}
+
+		//std::cout << "\n QUALIFIER: " << member->getFirstDecl()->getSourceRange().getEnd().getLocWithOffset(1).printToString(theRewriter.getSourceMgr()) << "\n";
+		//std::cout << "\nSTART: " << member->getFirstDecl()->getLocStart().printToString(theRewriter.getSourceMgr()) <<
+		//	           "\nEND: " << member->getFirstDecl()->getLocEnd().printToString(theRewriter.getSourceMgr()) << "\n";
+		//std::cout << "\nSTART: " << theRewriter.getSourceMgr().getPresumedLoc(member->getFirstDecl()->getLocStart()).getColumn() <<
+		//			   "\nEND: " << theRewriter.getSourceMgr().getPresumedLoc(member->getFirstDecl()->getLocEnd()).getColumn() << "\n";
+		//std::cout << " : " << theRewriter.getRewrittenText(help_sr);
+		//std::cout << "\n";
+
+		//std::cout << end.printToString(theRewriter.getSourceMgr()) << " : " << comment << "\n";
+
+		theRewriter.InsertText(end, " ///< " + comment);
+		count++;
+	}
+
+	void editDataVariable(CallExpr *e)
+	{
+		std::regex validData("^(d_)(.*)");
+
+		//std::cout << "member->getDeclName().getAsString() = " << member->getDeclName().getAsString() << "\n";
+
+		if (std::regex_match(member->getDeclName().getAsString(), validData))
+		{
+
+		}
+	}
+
+
+	bool VisitCallExpr(CallExpr *e)
+	{
+		//std::cout << "VisitCallExpr\n";
+
+		if (!member || !e->getCalleeDecl())
+		{
+			return true;
+		}
+
+		std::string memberLocation = member->getFirstDecl()->getLocation().printToString(theRewriter.getSourceMgr());
+		if (std::find(parsed_members.begin(), parsed_members.end(), memberLocation) != parsed_members.end())
+		{
+			return true;
+		}
+		parsed_members.push_back(memberLocation);
+
+		SourceRange comment_sr;		
+		if (e->getCalleeDecl()->getAsFunction()->getNameAsString() == "initData" && e->getNumArgs() >= 3)
+		{
+			//std::cout << "initData : " << memberLocation << "\n";
+			comment_sr = e->getArg(e->getNumArgs() - 3)->getSourceRange();
+		}		
+		/*else if (e->getCalleeDecl()->getAsFunction()->getNameAsString() == "initLink" && e->getNumArgs() >= 1)
+		{
+			//std::cout << "initLink : " << memberLocation << "\n";
+			comment_sr = e->getArg(e->getNumArgs() - 1)->getSourceRange();
+		}*/
+		else
+		{
+			return true;
+		}
+
+		std::string comment = theRewriter.getRewrittenText(comment_sr);
+		comment = comment.substr(1, comment.size() - 2); // remove first and last char (doublequotes)
+
+		if (comment.length() > 0)
+		{
+			//std::cout << "comment : " << comment << "\n";
+			editDataComment(comment);
+		}
+
+		return true;
+	}
 
     FieldDecl *member;
 	Rewriter &theRewriter;
 };
-
-
-
 
 class DerivedBaseHandler : public MatchFinder::MatchCallback 
 {
@@ -175,37 +186,17 @@ private:
     FindInitCallVisitor visitor;
 };
 
-
-
-
-
-class ComponentHandler : public MatchFinder::MatchCallback
-{
-public:
-	ComponentHandler(Rewriter &Rewrite) : Rewrite(Rewrite) {}
-
-	virtual void run(const MatchFinder::MatchResult &Result) {
-		// TODO
-		//const VarDecl *IncVar = Result.Nodes.getNodeAs<VarDecl>("incVarName");
-		//Rewrite.InsertText(IncVar->getLocStart(), "/* increment */", true, true);
-	}
-
-private:
-	Rewriter &Rewrite;
-};
-
-
 class MyASTConsumer : public ASTConsumer 
 {
 public:
-	MyASTConsumer(Rewriter &R) : Handler(R)
+    MyASTConsumer(Rewriter &R) : HandlerForDerivedBase(R) 
     {
         Matcher.addMatcher( 
             cxxRecordDecl( 
                 isDerivedFrom(hasName("Base"))//,
                 // has(cxxConstructorDecl(hasAnyConstructorInitializer(withInitializer(has(callExpr())))))
             ).bind("BaseDerived"),
-			&Handler
+            &HandlerForDerivedBase
         );
     }
 
@@ -215,7 +206,7 @@ public:
     }
 
 private:
-	ComponentHandler Handler;
+    DerivedBaseHandler HandlerForDerivedBase;
     MatchFinder Matcher;
 };
 
@@ -225,45 +216,17 @@ public:
     MyFrontendAction() {}
     
     void EndSourceFileAction() override 
-    {
-        //theRewriter.getEditBuffer( theRewriter.getSourceMgr().getMainFileID() ).write( llvm::outs() );
-
-		// At this point the rewriter's buffer should be full with the rewritten
-		// file contents.
-		//const RewriteBuffer &RewriteBuf = theRewriter.getEditBuffer(theRewriter.getSourceMgr().getMainFileID());
-		//RewriteBuf.write(llvm::outs());
-
-		/*
-		int test = RewriteBuf.size();
-		std::cout << "############# SIZE : " << test << " ##############" << std::endl;
-		for (RewriteRope::const_iterator it = RewriteBuf.begin(); it != RewriteBuf.end(); ++it)
-		{
-			std::cout << *it;
-		}
-		std::cout << std::endl;
-		*/
-
-		//std::cout << std::string(RewriteBuf.begin(), RewriteBuf.end());
-		//llvm::outs() << std::string(RewriteBuf->begin(), RewriteBuf->end());
-
-		/*
-		const RewriteBuffer *RewriteBuf = theRewriter.getRewriteBufferFor(theRewriter.getSourceMgr().getMainFileID());
-		if (RewriteBuf)
-		{
-			RewriteBuf->write(llvm::outs());
-		}
-		else
-		{
-			std::cout << "NO MODIF\n";
-		}
-		*/
+	{
+		theRewriter.overwriteChangedFiles();
+		//theRewriter.getEditBuffer(theRewriter.getSourceMgr().getMainFileID()).write(llvm::outs());
     }
 
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef file) override 
     {
         theRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
         CI.getDiagnostics().setClient(new IgnoringDiagConsumer());
-        std::cout<< "\n\n-------\nParsing file " << CI.getSourceManager().getFileEntryForID(theRewriter.getSourceMgr().getMainFileID())->getName() << "\n";
+		//std::cout << "\n-------\nParsing file " << CI.getSourceManager().getFileEntryForID(theRewriter.getSourceMgr().getMainFileID())->getName() << "\n";
+		//std::cout << std::flush;
         return llvm::make_unique<MyASTConsumer>(theRewriter);
     }
 
@@ -307,8 +270,7 @@ int main(int argc, char **argv) {
         files = compilation_database->getAllFiles();
     }
 
-    nb_files = files.size();
-    if (nb_files == 0) 
+	if (files.size() == 0)
     {
         llvm::errs() << "No file founds" << "\n";
         exit(2);
@@ -319,13 +281,15 @@ int main(int argc, char **argv) {
         [](const clang::tooling::CommandLineArguments &args, StringRef Filename) -> clang::tooling::CommandLineArguments {
             std::vector<std::string> a(args);
             //a.push_back("-isystem");
-            a.push_back("C:/dev/llvm/install/lib/clang/4.0.0/include");
-            a.push_back("-std=c++11");
+            //a.push_back("C:/dev/llvm/install/lib/clang/4.0.0/include");
+            //a.push_back("-std=c++11");
             //a.push_back("-v");
             return a;
     });
 
     int r = tool.run(clang::tooling::newFrontendActionFactory<MyFrontendAction>().get());
 	
+	//std::cout << "Done: " << count << " Data declarations edited.";
+
     return r;
 }
